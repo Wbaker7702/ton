@@ -190,8 +190,9 @@ class DhtMemberImpl : public DhtMember {
 
   void get_self_node(td::Promise<DhtNode> promise) override;
 
-  static constexpr size_t MAX_VALUES = 100000;
-  static constexpr size_t MAX_REVERSE_CONNECTIONS = 100000;
+  static size_t max_values_limit();
+  static size_t max_reverse_connections_limit();
+  static td::uint32 max_value_ttl_window();
 };
 
 }  // namespace dht

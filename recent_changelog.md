@@ -5,5 +5,6 @@
 3. Introduced custom block compression algorithm.
 4. Overlay improvements: improved overlay discovery on shard configuration update, private externals in custom overlays.
 5. Various improvements: session stats, telemetry in fast-sync overlay, earlier block broadcasts, limiting ttl for values in DHT, fixing search by utime in native blockexplorer, faster downloading candidates in validator session, parallelization of storing to cell_db, avoiding touching packfiles on startup.
+6. DHT cache limits are now tunable via environment variables (`TON_DHT_MAX_VALUES`, `TON_DHT_MAX_REVERSE_CONNECTIONS`, `TON_DHT_MAX_TTL_SECONDS`) to ease rollout of the new caching policies.
 
 Besides the work of the core team, this update is based on the efforts of the Tonstudio team: @hacker-volodya @Shvandre; and @mkiesel (avoiding touching packfiles on startup).
