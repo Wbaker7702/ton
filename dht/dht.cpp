@@ -24,6 +24,7 @@
 #include "td/utils/base64.h"
 
 #include "td/utils/format.h"
+#include "td/utils/logging.h"
 
 #include "td/db/RocksDb.h"
 
@@ -34,9 +35,98 @@
 #include "dht-query.hpp"
 #include "dht-in.hpp"
 
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+
 namespace ton {
 
 namespace dht {
+
+namespace {
+
+constexpr size_t kDefaultMaxValues = 100000;
+constexpr size_t kDefaultMaxReverseConnections = 100000;
+constexpr td::uint32 kDefaultMaxTtlWindow = 3600;
+constexpr size_t kMinCapacity = 1;
+constexpr size_t kMaxCapacity = 5'000'000;
+constexpr td::uint32 kMinTtlWindow = 60;
+constexpr td::uint32 kMaxTtlWindow = 86400;  // 24 hours
+
+size_t parse_env_size_limit(const char *name, size_t default_value, size_t min_value, size_t max_value) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  unsigned long long parsed = std::strtoull(raw, &end, 10);
+  if (errno != 0 || end == raw || *end != '\0') {
+    LOG(WARNING) << "Ignoring invalid value of " << name << "='" << raw << "'";
+    return default_value;
+  }
+
+  size_t value = static_cast<size_t>(parsed);
+  if (value < min_value) {
+    LOG(WARNING) << name << " value " << value << " is below minimum " << min_value << ", clamping";
+    value = min_value;
+  } else if (value > max_value) {
+    LOG(WARNING) << name << " value " << value << " exceeds maximum " << max_value << ", clamping";
+    value = max_value;
+  }
+
+  LOG(INFO) << "Using " << name << "=" << value;
+  return value;
+}
+
+td::uint32 parse_env_u32_limit(const char *name, td::uint32 default_value, td::uint32 min_value,
+                               td::uint32 max_value) {
+  const char *raw = std::getenv(name);
+  if (raw == nullptr || *raw == '\0') {
+    return default_value;
+  }
+
+  errno = 0;
+  char *end = nullptr;
+  unsigned long parsed = std::strtoul(raw, &end, 10);
+  if (errno != 0 || end == raw || *end != '\0') {
+    LOG(WARNING) << "Ignoring invalid value of " << name << "='" << raw << "'";
+    return default_value;
+  }
+
+  td::uint32 value = static_cast<td::uint32>(parsed);
+  if (value < min_value) {
+    LOG(WARNING) << name << " value " << value << " is below minimum " << min_value << ", clamping";
+    value = min_value;
+  } else if (value > max_value) {
+    LOG(WARNING) << name << " value " << value << " exceeds maximum " << max_value << ", clamping";
+    value = max_value;
+  }
+
+  LOG(INFO) << "Using " << name << "=" << value;
+  return value;
+}
+
+}  // namespace
+
+size_t DhtMemberImpl::max_values_limit() {
+  static const size_t limit = parse_env_size_limit("TON_DHT_MAX_VALUES", kDefaultMaxValues, kMinCapacity, kMaxCapacity);
+  return limit;
+}
+
+size_t DhtMemberImpl::max_reverse_connections_limit() {
+  static const size_t limit =
+      parse_env_size_limit("TON_DHT_MAX_REVERSE_CONNECTIONS", kDefaultMaxReverseConnections, kMinCapacity,
+                           kMaxCapacity);
+  return limit;
+}
+
+td::uint32 DhtMemberImpl::max_value_ttl_window() {
+  static const td::uint32 window =
+      parse_env_u32_limit("TON_DHT_MAX_TTL_SECONDS", kDefaultMaxTtlWindow, kMinTtlWindow, kMaxTtlWindow);
+  return window;
+}
 
 td::actor::ActorOwn<DhtMember> DhtMember::create(adnl::AdnlNodeIdShort id, std::string db_root,
                                                  td::actor::ActorId<keyring::Keyring> keyring,
@@ -241,7 +331,17 @@ void DhtMemberImpl::process_query(adnl::AdnlNodeIdShort src, ton_api::dht_findVa
 }
 
 td::Status DhtMemberImpl::store_in(DhtValue value) {
-  if (value.ttl() > (td::uint32)td::Clocks::system() + 3600 + 60) {
+  auto now = static_cast<td::uint32>(td::Clocks::system());
+  auto ttl_window = max_value_ttl_window();
+  td::uint64 max_allowed_ttl = static_cast<td::uint64>(now) + ttl_window;
+  if (max_allowed_ttl > std::numeric_limits<td::uint32>::max()) {
+    max_allowed_ttl = std::numeric_limits<td::uint32>::max();
+  }
+  td::uint64 max_allowed_ttl_with_slack = max_allowed_ttl + 60;  // keep historical slack for clock drift
+  if (max_allowed_ttl_with_slack > std::numeric_limits<td::uint32>::max()) {
+    max_allowed_ttl_with_slack = std::numeric_limits<td::uint32>::max();
+  }
+  if (value.ttl() > static_cast<td::uint32>(max_allowed_ttl_with_slack)) {
     // clients typically set ttl = 1 hour
     return td::Status::Error("ttl is too big");
   }
@@ -568,8 +668,17 @@ void DhtMemberImpl::check() {
     save_to_db();
   }
 
+  const auto max_values_allowed = max_values_limit();
+  const auto max_reverse_connections_allowed = max_reverse_connections_limit();
+  const auto now_ts = td::Clocks::system();
+  bool trimmed_values_by_limit = false;
   for (auto it = values_ttl_order_.begin();
-       it != values_ttl_order_.end() && (it->first < td::Clocks::system() || values_.size() > MAX_VALUES);) {
+       it != values_ttl_order_.end() && (it->first < now_ts || values_.size() > max_values_allowed);) {
+    if (!trimmed_values_by_limit && values_.size() > max_values_allowed) {
+      LOG(WARNING) << this << ": values cache size " << values_.size() << " exceeds limit "
+                   << max_values_allowed << ", pruning oldest entries";
+      trimmed_values_by_limit = true;
+    }
     CHECK(values_.erase(it->second));
     it = values_ttl_order_.erase(it);
   }
@@ -617,9 +726,15 @@ void DhtMemberImpl::check() {
       }
     }
   }
+  bool trimmed_reverse_connections_by_limit = false;
   for (auto it = reverse_connections_ttl_order_.begin();
        it != reverse_connections_ttl_order_.end() &&
-       (it->first.is_in_past() || reverse_connections_.size() > MAX_REVERSE_CONNECTIONS);) {
+       (it->first.is_in_past() || reverse_connections_.size() > max_reverse_connections_allowed);) {
+    if (!trimmed_reverse_connections_by_limit && reverse_connections_.size() > max_reverse_connections_allowed) {
+      LOG(WARNING) << this << ": reverse connection cache size " << reverse_connections_.size()
+                   << " exceeds limit " << max_reverse_connections_allowed << ", pruning oldest entries";
+      trimmed_reverse_connections_by_limit = true;
+    }
     CHECK(reverse_connections_.erase(it->second));
     it = reverse_connections_ttl_order_.erase(it);
   }
