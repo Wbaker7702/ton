@@ -89,7 +89,10 @@ class AdnlNetworkConnectionTunnel : public AdnlNetworkConnection {
     }
     encryptor_ = R.move_as_ok();
     pub_key_hash_ = pub_key_.compute_short_id();
-    //ready_.store(true, std::memory_order_release);
+    ready_.store(true, std::memory_order_release);
+    if (callback_) {
+      callback_->on_change_state(true);
+    }
   }
   void get_ip_str(td::Promise<td::string> promise) override {
     promise.set_value("tunnel");
